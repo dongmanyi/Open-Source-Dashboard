@@ -554,6 +554,9 @@ async function applyRepositorySigAssignments({ pool, assignments, orgName = DEFA
             disabled += 1;
         }
 
+        if (changes.length > 0) {
+            await client.query('UPDATE organizations SET snapshot_generation = snapshot_generation + 1 WHERE id = $1', [orgId]);
+        }
         const reaggregation = await reaggregateAffectedHistoricalSnapshots(
             client,
             orgId,

@@ -1,154 +1,76 @@
-// A one-time script to correct historical commit stats without re-running PR/Issue API calls.
-const {
-    fetchCommitHistoryViaGraphQL,
-} = require('./github_commit_history');
-
+// Recollect commits while retaining existing PR/Issue facts. Publish all levels together.
 require('dotenv').config();
 const { Pool } = require('pg');
-const {
-    DEFAULT_PROPERTY_NAME,
-    syncRepositorySigsFromGitHub,
-} = require('./repository_sig_sync');
-const { persistRepoCommitStats } = require('./commit_author_stats');
+const Redis = require('redis');
+const { fetchCommitHistoryViaGraphQL } = require('./github_commit_history');
+const { DEFAULT_PROPERTY_NAME, syncRepositorySigsFromGitHub } = require('./repository_sig_sync');
+const { backfillSnapshotDates } = require('./snapshot_backfill');
+const { invalidateSnapshotCaches } = require('./snapshot_batch');
 
-const ORG_NAME = 'hust-open-atom-club'; // 确保与主程序一致
+const formatDate = date => [date.getFullYear(), String(date.getMonth() + 1).padStart(2, '0'),
+    String(date.getDate()).padStart(2, '0')].join('-');
 
-// --- 数据库连接 (从主程序复制) ---
-const pool = new Pool({
-    user: process.env.DB_USER,
-    host: process.env.DB_HOST,
-    database: process.env.DB_NAME,
-    password: process.env.DB_PASSWORD,
-    port: process.env.DB_PORT,
-});
+async function fetchStoredApiHistory(pool, repo, start, end) {
+    const parameters = [repo.id, formatDate(start), formatDate(end)];
+    const snapshots = await pool.query(`SELECT snapshot_date, new_prs, closed_merged_prs, new_issues, closed_issues
+        FROM repo_snapshots WHERE repo_id = $1 AND snapshot_date BETWEEN $2 AND $3`, parameters);
+    const facts = await pool.query(`SELECT cra.snapshot_date, c.github_username AS username,
+        c.github_id, c.avatar_url, cra.prs_opened, cra.prs_closed, cra.issues_opened, cra.issues_closed
+        FROM contributor_repo_activities cra JOIN contributors c ON c.id = cra.contributor_id
+        WHERE cra.repo_id = $1 AND cra.snapshot_date BETWEEN $2 AND $3
+          AND (cra.prs_opened <> 0 OR cra.prs_closed <> 0 OR cra.issues_opened <> 0 OR cra.issues_closed <> 0)`, parameters);
+    const statsMap = new Map(snapshots.rows.map(row => [formatDate(row.snapshot_date), row]));
+    const contributorDetailsMap = new Map([...statsMap.keys()].map(date => [date, new Map()]));
+    for (const row of facts.rows) {
+        const contributors = contributorDetailsMap.get(formatDate(row.snapshot_date));
+        if (!contributors) throw new Error('Contributor facts lack a repository snapshot; use a full backfill');
+        contributors.set(row.username, row);
+    }
+    for (const date = new Date(start); date <= end; date.setDate(date.getDate() + 1)) {
+        if (!statsMap.has(formatDate(date))) throw new Error('Repository snapshots missing; use a full backfill');
+    }
+    return { statsMap, contributorDetailsMap };
+}
 
-pool.on('error', (err) => {
-    console.error('Unexpected error on idle client', err);
-    process.exit(-1);
-});
-
-// --- 必要的工具函数 (从主程序复制) ---
-
-const formatDate = (date) => {
-    const year = date.getFullYear();
-    const month = (date.getMonth() + 1).toString().padStart(2, '0');
-    const day = date.getDate().toString().padStart(2, '0');
-    return `${year}-${month}-${day}`;
-};
-
-async function runPromisesWithConcurrency(tasks, concurrency) {
-    const results = [];
-    const failures = [];
-    let currentIndex = 0;
-    const worker = async () => {
-        while (currentIndex < tasks.length) {
-            const taskIndex = currentIndex++;
-            const task = tasks[taskIndex];
-            try {
-                results[taskIndex] = await task();
-            } catch (error) {
-                results[taskIndex] = error;
-                failures.push(error);
-                console.error(`Task at index ${taskIndex} failed:`, error.message);
-            }
+async function main(args = process.argv.slice(2)) {
+    const days = args.length ? Number(args[0]) : 30;
+    if (args.length > 1 || !Number.isSafeInteger(days) || days < 1 || days > 3650) {
+        throw new Error('Usage: node fix_git_stats.js [days: 1-3650]');
+    }
+    const pool = new Pool({ user: process.env.DB_USER, host: process.env.DB_HOST,
+        database: process.env.DB_NAME, password: process.env.DB_PASSWORD, port: process.env.DB_PORT });
+    const redis = Redis.createClient({ url: process.env.REDIS_URL || 'redis://localhost:6379',
+        socket: { reconnectStrategy: false } });
+    redis.on('error', error => console.error('Redis:', error.message));
+    const orgName = 'hust-open-atom-club';
+    try {
+        await redis.connect();
+        await syncRepositorySigsFromGitHub({ pool, githubToken: process.env.GITHUB_TOKEN,
+            orgName, propertyName: process.env.GITHUB_SIG_PROPERTY || DEFAULT_PROPERTY_NAME });
+        const { rows: orgs } = await pool.query('SELECT id FROM organizations WHERE name = $1', [orgName]);
+        if (!orgs.length) throw new Error('Organization not found');
+        const orgId = orgs[0].id;
+        const { rows: repositories } = await pool.query(
+            'SELECT id, name, sig_id FROM repositories WHERE org_id = $1 AND sig_id IS NOT NULL AND is_in_organization = TRUE ORDER BY id', [orgId]);
+        if (!repositories.length) throw new Error('No tracked repositories');
+        const dates = [];
+        for (let i = days; i >= 1; i--) {
+            const date = new Date();
+            date.setHours(0, 0, 0, 0);
+            date.setDate(date.getDate() - i);
+            dates.push(date);
         }
-    };
-    const workers = Array(concurrency).fill(null).map(() => worker());
-    await Promise.all(workers);
-
-    if (failures.length > 0) {
-        throw new AggregateError(failures, `${failures.length} commit-history task(s) failed.`);
-    }
-
-    return results;
-}
-
-
-// --- 核心修复逻辑 ---
-
-/**
- * 针对单个仓库和单个日期，通过 GraphQL 重新计算 commit 数据并更新到数据库
- */
-async function correctStatsForRepo(repo, targetDate, stats) {
-    const targetDateStr = formatDate(targetDate);
-    // 为了日志清晰，将日志移到这里
-    console.log(`  - Processing repo [${repo.name}] on ${targetDateStr}...`);
-
-    const result = await persistRepoCommitStats({
-        pool,
-        repoId: repo.id,
-        snapshotDate: targetDateStr,
-        commitStats: stats,
-        updateOnly: true,
-    });
-
-    if (result.stored) {
-        console.log(`    ✅ Updated [${repo.name}]: commits=${stats.new_commits}, lines=+${stats.lines_added}/-${stats.lines_deleted}`);
-    } else {
-        console.warn(`    ⚠️ No existing record found for [${repo.name}] on ${targetDateStr}. This is OK if the repo had no API activity on that day.`);
+        await backfillSnapshotDates({ pool, orgId, orgName, repositories, dates,
+            fetchCommits: (repo, start, end) => fetchCommitHistoryViaGraphQL(repo.name, start, end),
+            fetchApi: (repo, start, end) => fetchStoredApiHistory(pool, repo, start, end),
+            afterCommit: () => invalidateSnapshotCaches(redis, pool, orgId, orgName),
+            onPublished: async date => console.log('Published corrected commit history:', date),
+        });
+    } finally {
+        await pool.end();
+        if (redis.isOpen) await redis.quit();
     }
 }
 
-/**
- * 主修复函数
- * @param {number} daysToFix 要修复过去多少天的数据
- */
-async function runCommitStatsCorrection(daysToFix = 30) {
-    console.log('--- [START] GraphQL Commit Stats Correction Script ---');
-    console.log(`This will recalculate and update commit/line stats for the last ${daysToFix} days.`);
-
-    await syncRepositorySigsFromGitHub({
-        pool,
-        githubToken: process.env.GITHUB_TOKEN,
-        orgName: ORG_NAME,
-        propertyName: process.env.GITHUB_SIG_PROPERTY || DEFAULT_PROPERTY_NAME,
-    });
-
-    // 获取所有需要监控的仓库
-    const orgResult = await pool.query("SELECT id FROM organizations WHERE name = $1", [ORG_NAME]);
-    const org = orgResult.rows[0];
-    if (!org) {
-        throw new Error('Monitored organization not found in DB.');
-    }
-    const reposResult = await pool.query('SELECT id, name FROM repositories WHERE org_id = $1 AND sig_id IS NOT NULL', [org.id]);
-    const repositories = reposResult.rows;
-    console.log(`Found ${repositories.length} repositories to process.`);
-
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-
-    const startDate = new Date(today);
-    startDate.setDate(today.getDate() - daysToFix);
-    const endDate = new Date(today);
-    endDate.setDate(today.getDate() - 1);
-
-    const tasks = repositories.map(repo => async () => {
-        console.log(`\n--- Fetching ${repo.name}: ${formatDate(startDate)} to ${formatDate(endDate)} ---`);
-        const statsMap = await fetchCommitHistoryViaGraphQL(repo.name, startDate, endDate);
-
-        for (let i = daysToFix; i >= 1; i--) {
-            const targetDate = new Date(today);
-            targetDate.setDate(today.getDate() - i);
-            await correctStatsForRepo(repo, targetDate, statsMap.get(formatDate(targetDate)));
-        }
-    });
-
-    await runPromisesWithConcurrency(tasks, 5);
-    
-    // 注意：修复完成后，还需要手动重新聚合 SIG 和 Organization 的数据
-    // 但为了让工程量最小化，我们可以依赖下一次的定时任务来自动完成聚合。
-    // 定时任务会采集昨天的数据并触发聚合，可以顺带把更早的数据也重新聚合一遍。
-    // 如果希望立即看到效果，需要额外编写聚合代码。
-    // 这里我们选择最简单的方式：等待下一次定时任务。
-
-    console.log('\n--- [FINISH] GraphQL Commit Stats Correction Script ---');
-    console.log('Repo-level commit stats have been corrected.');
-    console.log('SIG and Organization level stats will be fully corrected after the next scheduled job runs.');
-    await pool.end(); // 关闭数据库连接
-}
-
-// --- 运行脚本 ---
-runCommitStatsCorrection(30).catch(err => {
-    console.error('An error occurred during the correction script:', err);
-    pool.end();
-});
+if (require.main === module) main().catch(error => { console.error(error.message); process.exitCode = 1; });
+module.exports = { fetchStoredApiHistory, main };

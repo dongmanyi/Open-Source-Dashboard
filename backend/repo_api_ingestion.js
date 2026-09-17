@@ -3,7 +3,8 @@ const { persistRepoApiStats: defaultPersistRepoApiStats } = require('./contribut
 
 function recordContributorActivities(contributorStats, items, metric) {
     for (const item of items) {
-        const username = item.user.login;
+        const username = item.user?.login;
+        if (!username) continue;
         if (isBotContributor(username)) continue;
 
         if (!contributorStats.has(username)) {
@@ -21,14 +22,11 @@ function recordContributorActivities(contributorStats, items, metric) {
     }
 }
 
-async function collectAndPersistRepoApiStats({
+async function collectRepoApiStats({
     githubRest,
-    pool,
     orgName,
-    repoId,
     repoName,
     snapshotDate,
-    persistRepoApiStats = defaultPersistRepoApiStats,
 }) {
     const repoQuery = `repo:${orgName}/${repoName}`;
 
@@ -51,6 +49,12 @@ async function collectAndPersistRepoApiStats({
         per_page: 100,
     });
 
+    for (const response of [createdPrs, createdIssues, closedPrs, closedIssues]) {
+        if (response.incomplete_results || !Array.isArray(response.items)
+            || response.items.length !== response.total_count) {
+            throw new Error('Incomplete GitHub search results; refusing to publish partial data');
+        }
+    }
     const contributorStats = new Map();
     recordContributorActivities(contributorStats, createdPrs.items, 'prs_opened');
     recordContributorActivities(contributorStats, closedPrs.items, 'prs_closed');
@@ -66,22 +70,17 @@ async function collectAndPersistRepoApiStats({
     };
     const contributorDetails = Array.from(contributorStats.values());
 
-    const persistenceResult = await persistRepoApiStats({
-        pool,
-        orgName,
-        repoId,
-        snapshotDate,
-        apiMetrics,
-        contributorDetails,
-    });
+    return { apiMetrics, contributorDetails };
+}
 
-    return {
-        ...persistenceResult,
-        apiMetrics,
-        contributorDetails,
-    };
+async function collectAndPersistRepoApiStats(options) {
+    const collected = await collectRepoApiStats(options);
+    const persist = options.persistRepoApiStats || defaultPersistRepoApiStats;
+    const persisted = await persist({ ...options, ...collected });
+    return { ...persisted, ...collected };
 }
 
 module.exports = {
+    collectRepoApiStats,
     collectAndPersistRepoApiStats,
 };

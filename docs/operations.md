@@ -49,6 +49,7 @@ docker compose logs migrate
 psql -d oss_dashboard -f db/migrations/001_github_custom_property_sigs.sql
 psql -d oss_dashboard -f db/migrations/002_repository_organization_membership.sql
 psql -d oss_dashboard -f db/migrations/003_organization_ingestion_freshness.sql
+psql -d oss_dashboard -f db/migrations/004_snapshot_generation.sql
 ```
 
 生产数据库迁移前：
@@ -85,7 +86,7 @@ cd backend
 node run_graphql_backfill.js 30
 ```
 
-回填后显式清空 Redis：
+兼容旧命令中的 `--flush-cache`；现在每次发布后都会失效相关缓存，不再执行全库清空：
 
 ```bash
 node run_graphql_backfill.js 30 --flush-cache
@@ -98,7 +99,7 @@ node backfill_date_range.js --date 2026-09-01
 node backfill_date_range.js --start-date 2026-09-01 --end-date 2026-09-07
 ```
 
-该脚本也支持 `--flush-cache`。`--reset-existing` 会重置目标范围内的已有数据，只应在确认范围和备份后使用。
+`--reset-existing` 现在只忽略保存的进度，不再预先删除数据。旧数据会一直保留到目标日期的新批次成功提交。
 
 只回填单个仓库：
 
@@ -106,28 +107,48 @@ node backfill_date_range.js --start-date 2026-09-01 --end-date 2026-09-07
 node backfill_single_repo.js repository-name
 ```
 
-脚本接收组织内的仓库名称，不包含 `owner/` 前缀，默认回填最近 30 天，并写入该仓库的 Commit、PR 和 Issue 快照。它不会完整更新 SIG 和组织级聚合：随后运行 `run_reaggregation.js` 只能同步 Commit 与代码行，不能同步 PR 和 Issue。
+脚本接收组织内的受跟踪仓库名称，不包含 `owner/` 前缀，默认回填最近 30 天。每个日期会在同一事务内替换该仓库的 Commit、PR、Issue 和贡献者事实，并重建 SIG、组织的全部聚合指标。其他仓库的原始事实保持不变。
 
-如果修复涉及 PR 或 Issue，并要求仓库、SIG 和组织数据保持一致，应改用覆盖相同日期的 `backfill_date_range.js`。该脚本会处理全部受跟踪仓库，并重建目标日期的全部上层指标。以上命令在容器中执行时，在命令前加 `docker compose exec backend`。
+如需重新采集全部受跟踪仓库，应使用 `backfill_date_range.js`。历史回填和单仓库修复都不更新组织的“最近更新时间”；只有完整的日常采集成功发布才更新。以上命令在容器中执行时，在命令前加 `docker compose exec backend`。
 
 ## 重新聚合
 
-已有 SIG 和组织快照行存在、但其中的 Git 聚合字段需要重新计算时：
+仅重新采集 Commit、保留已有 PR/Issue 事实，可运行 `node fix_git_stats.js 30`。它同样按日期原子发布并重建全部上层指标；如果底层日期缺失则要求完整回填，不会静默跳过。该操作不更新组织采集完成时间。
+
+底层仓库快照正确、上层聚合需要修复时，显式指定日期：
 
 ```bash
 cd backend
-node run_reaggregation.js
+node run_reaggregation.js --date 2026-09-07
 ```
 
-需要同时清空 Redis：
+只读检查所有保留日期（发现差异时退出码为 1），也可以传入单个日期：
 
 ```bash
-node run_reaggregation.js --flush-cache
+node check_snapshot_consistency.js
+node check_snapshot_consistency.js 2026-09-07
 ```
 
-当前脚本重算最近 365 天中 SIG 和组织级的 Commit、增加行数与删除行数，不重新请求 GitHub，也不重算 PR、Issue 字段。它只 `UPDATE` 已存在的快照行，不会为缺失日期插入新行。
+重新聚合不请求 GitHub，在一个事务内重建目标日期 SIG 和组织的全部八个可加和指标（含缺失的上层行），提交后自动失效相关缓存，不更新采集完成时间。没有任何受跟踪仓库快照的日期会被拒绝，避免凭空制造零值数据。
 
-因此，它只适合底层仓库快照正确、上层快照行已经存在，但 Git 指标需要修复的场景。如果 SIG 或组织快照缺少某些日期，应使用 `backfill_date_range.js` 覆盖缺失范围，由完整回填流程重新写入全部聚合字段。
+检查器比较每个 SIG 与其仓库之和，再比较组织与 SIG 之和；它不能证明 GitHub 源数据完整，也不把跨仓库去重贡献人数当作可加和指标。底层数据不完整时应使用完整回填。
+
+## 原子发布与并发
+
+升级时先运行 `004_snapshot_generation.sql`，并停止旧版本后端及旧回填脚本，再启动新版本；旧脚本不遵守版本锁，不能与新版本混跑。Docker Compose 的迁移服务会自动应用此迁移。
+
+日常采集先收齐全部受跟踪仓库（包括零活跃仓库）的数据，然后用一个数据库连接和事务发布仓库、贡献者、SIG、组织快照。采集或提交失败时保留上一批完整数据。回填每次收集最多七天，按日期原子发布；后续日期失败不会撤销之前已提交的完整日期。
+
+发布时锁定组织并校验采集开始时的数据版本与仓库归属。其他任务已发布或归属已变更时，本批次报错并要求重新采集，不覆盖新结果。进度文件记录已提交的日期和版本；旧格式或版本不符的进度会被忽略。API 缓存按数据版本隔离，旧请求不会污染新版本缓存。数据库已提交但 Redis 失效失败时会明确报告已提交，不能把它当成数据库回滚。
+
+本地数据库集成测试（只使用专用测试数据库；测试会创建并清理随机 schema）：
+
+```bash
+cd backend
+SNAPSHOT_TEST_DATABASE_URL=postgres://postgres:password@127.0.0.1:5432/osd_test npm test
+```
+
+未提供该变量时只运行普通测试并跳过 PostgreSQL 集成测试；Backend CI 使用独立 PostgreSQL 服务执行全部测试。
 
 ## 启动时维护开关
 
