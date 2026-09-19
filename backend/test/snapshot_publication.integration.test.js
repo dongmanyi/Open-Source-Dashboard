@@ -11,6 +11,8 @@ const { checkSnapshotConsistency } = require('../snapshot_hierarchy');
 const { reaggregateSnapshotDate } = require('../snapshot_reaggregation');
 const { backfillSnapshotDates } = require('../snapshot_backfill');
 const { fetchStoredApiHistory } = require('../fix_git_stats');
+const express = require('express');
+const { installSnapshotCache } = require('../snapshot_cache');
 
 // Explicit opt-in only: creates and drops its own random schema, never public.
 test('PostgreSQL atomic snapshot publication', { skip: !process.env.SNAPSHOT_TEST_DATABASE_URL }, async t => {
@@ -200,6 +202,68 @@ test('PostgreSQL atomic snapshot publication', { skip: !process.env.SNAPSHOT_TES
         assert.equal(published.length, 7);
         assert.equal((await pool.query("SELECT * FROM activity_snapshots WHERE snapshot_date = '2026-09-17'")).rows.length, 0);
         assert.deepEqual(await checkSnapshotConsistency(pool, 1), []);
+    });
+    await t.test('reaggregation refuses partial coverage without changing parents or generation', async () => {
+        const partialDate = '2026-09-08';
+        await pool.query('INSERT INTO repo_snapshots (repo_id,snapshot_date,new_commits) VALUES (1,$1,3)', [partialDate]);
+        await pool.query('INSERT INTO activity_snapshots (org_id,snapshot_date,new_commits) VALUES (1,$1,99)', [partialDate]);
+        const before = await dump();
+        await assert.rejects(reaggregateSnapshotDate({ pool, orgId: 1, snapshotDate: partialDate }), /Incomplete repository coverage.*two.*full backfill/);
+        assert.deepEqual(await dump(), before);
+        // Full collection explicitly supplies zero-activity rows; these are valid coverage.
+        await publish([entry(1, 0), entry(2, 0)], { snapshotDate: partialDate });
+        await reaggregateSnapshotDate({ pool, orgId: 1, snapshotDate: partialDate });
+        assert.deepEqual(await checkSnapshotConsistency(pool, 1, partialDate), []);
+        assert.equal((await pool.query('SELECT new_commits FROM activity_snapshots WHERE snapshot_date=$1', [partialDate])).rows[0].new_commits, 0);
+    });
+    await t.test('API multi-query responses stay on one generation during publication', { timeout: 10000 }, async sub => {
+        const readPool = new Pool({ connectionString, options: `-c search_path=${schema}`, max: 2 });
+        const app = express();
+        const cache = new Map();
+        installSnapshotCache(app, { get: async key => cache.get(key),
+            setEx: async (key, ttl, value) => cache.set(key, value) }, readPool, 'test-org');
+        let firstRead;
+        let resume;
+        const ready = new Promise(resolve => { firstRead = resolve; });
+        const paused = new Promise(resolve => { resume = resolve; });
+        app.get('/api/day', async (req, res, next) => {
+            try {
+                const summary = await readPool.query('SELECT new_commits FROM activity_snapshots WHERE org_id=1 AND snapshot_date=$1', [date]);
+                firstRead();
+                await paused;
+                const repositories = await readPool.query('SELECT SUM(new_commits)::integer AS total FROM repo_snapshots WHERE snapshot_date=$1', [date]);
+                const contributors = await readPool.query('SELECT SUM(commits_count)::integer AS total FROM contributor_daily_activities WHERE org_id=1 AND snapshot_date=$1', [date]);
+                const generation = await readPool.query('SELECT snapshot_generation FROM organizations WHERE id=1');
+                res.json({ summary: summary.rows[0].new_commits, repositories: repositories.rows[0].total,
+                    contributors: contributors.rows[0].total, generation: generation.rows[0].snapshot_generation });
+            } catch (error) { next(error); }
+        });
+        const server = app.listen(0, '127.0.0.1');
+        sub.after(async () => {
+            resume();
+            server.closeAllConnections();
+            await new Promise(resolve => server.close(resolve));
+            await readPool.end();
+        });
+        await new Promise(resolve => server.once('listening', resolve));
+        const url = `http://127.0.0.1:${server.address().port}/api/day`;
+        const oldGeneration = await readSnapshotGeneration(pool, 1);
+        const oldCommits = (await pool.query('SELECT new_commits FROM activity_snapshots WHERE org_id=1 AND snapshot_date=$1', [date])).rows[0].new_commits;
+        const firstRelease = new Promise(resolve => readPool.once('release', resolve));
+        const pending = fetch(url);
+        await ready;
+        await publish([entry(1, 9), entry(2, 9)]);
+        resume();
+        const response = await pending;
+        assert.equal(response.status, 200);
+        assert.deepEqual(await response.json(), { summary: oldCommits, repositories: oldCommits,
+            contributors: oldCommits, generation: oldGeneration });
+        await firstRelease;
+        const secondRelease = new Promise(resolve => readPool.once('release', resolve));
+        assert.deepEqual(await (await fetch(url)).json(), { summary: 18, repositories: 18, contributors: 18,
+            generation: String(BigInt(oldGeneration) + 1n) });
+        await secondRelease;
+        assert.equal(readPool.idleCount, readPool.totalCount);
     });
     await t.test('read-only check CLI reports coverage, differences and missing dates', async () => {
         const url = new URL(connectionString);

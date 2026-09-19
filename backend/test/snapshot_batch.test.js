@@ -1,5 +1,6 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
+const { EventEmitter } = require('node:events');
 const { validateBatch, collectSnapshotBatch, publishSnapshotBatch } = require('../snapshot_batch');
 const { collectRepoApiStats } = require('../repo_api_ingestion');
 const { installSnapshotCache } = require('../snapshot_cache');
@@ -73,20 +74,24 @@ test('in-flight cache writes cannot populate a newer snapshot generation', async
     const keys = new Map();
     const redis = { get: async key => keys.get(key), setEx: async (key, ttl, value) => keys.set(key, value) };
     installSnapshotCache({ use: (path, fn) => { middleware = fn; } }, redis,
-        { query: async () => ({ rows: [{ snapshot_generation: generation }] }) }, 'org');
+        { query: async () => { throw new Error('Unexpected pool query'); },
+            connect: async () => Object.assign(new EventEmitter(), {
+                query: async () => ({ rows: [{ snapshot_generation: generation }] }), release() {} }) }, 'org');
     let resume;
     const paused = new Promise(resolve => { resume = resolve; });
     const old = new Promise((resolve, reject) => {
-        middleware({}, {}, error => {
+        const response = new EventEmitter();
+        middleware({}, response, error => {
             if (error) return reject(error);
-            paused.then(async () => { await redis.setEx('summary', 10, 'old'); resolve(); }).catch(reject);
+            paused.then(async () => { await redis.setEx('summary', 10, 'old'); response.emit('finish'); resolve(); }).catch(reject);
         });
     });
     await new Promise(resolve => setImmediate(resolve));
     generation = '2';
-    await new Promise((resolve, reject) => middleware({}, {}, async error => {
+    const response = new EventEmitter();
+    await new Promise((resolve, reject) => middleware({}, response, async error => {
         if (error) return reject(error);
-        try { await redis.setEx('summary', 10, 'new'); resolve(); } catch (err) { reject(err); }
+        try { await redis.setEx('summary', 10, 'new'); response.emit('finish'); resolve(); } catch (err) { reject(err); }
     }));
     resume();
     await old;
