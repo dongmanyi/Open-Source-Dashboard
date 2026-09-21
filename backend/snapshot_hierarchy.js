@@ -6,6 +6,22 @@ const METRICS = Object.freeze([
 ]);
 
 async function rebuildSnapshotHierarchy(client, orgId, snapshotDate) {
+    // Every caller holds the organization lock and uses a single transaction.
+    // Check after repository replacements so a partial repair may fill its own
+    // missing row, but cannot publish totals with any other tracked row absent.
+    // Keep this shared by full/partial publication and standalone reaggregation.
+    const coverage = await client.query(`SELECT r.id, r.name, rs.repo_id AS snapshot_repo_id
+        FROM repositories r LEFT JOIN repo_snapshots rs
+          ON rs.repo_id = r.id AND rs.snapshot_date = $2
+        WHERE r.org_id = $1 AND r.sig_id IS NOT NULL AND r.is_in_organization = TRUE
+        ORDER BY r.id`, [orgId, snapshotDate]);
+    if (!coverage.rows.length) throw new Error('No tracked repositories; use a full backfill');
+    // Local created_at is registration time, not historical membership. Explicit
+    // zero rows count as coverage; inferred zeroes for missing rows do not.
+    const missing = coverage.rows.filter(row => row.snapshot_repo_id === null);
+    if (missing.length) {
+        throw new Error(`Incomplete repository coverage for ${snapshotDate}: ${missing.map(row => row.name).join(', ')}; use a full backfill`);
+    }
     await client.query(
         `INSERT INTO sig_snapshots (sig_id, snapshot_date, ${METRICS.join(', ')})
          SELECT sig.id, $2::date,

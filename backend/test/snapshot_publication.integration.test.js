@@ -265,6 +265,38 @@ test('PostgreSQL atomic snapshot publication', { skip: !process.env.SNAPSHOT_TES
         await secondRelease;
         assert.equal(readPool.idleCount, readPool.totalCount);
     });
+    await t.test('partial publication rejects a missing peer snapshot and rolls back all facts', async () => {
+        const partialDate = '2026-09-21';
+        await pool.query('INSERT INTO repo_snapshots (repo_id,snapshot_date,new_commits) VALUES (1,$1,3)', [partialDate]);
+        await pool.query('INSERT INTO sig_snapshots (sig_id,snapshot_date,new_commits) VALUES (1,$1,99)', [partialDate]);
+        await pool.query('INSERT INTO activity_snapshots (org_id,snapshot_date,new_commits) VALUES (1,$1,99)', [partialDate]);
+        const before = await dump();
+        let invalidated = false;
+        await assert.rejects(publish([entry(1, 5)], { partial: true, repositories: repositories.slice(0, 1),
+            snapshotDate: partialDate, afterCommit: async () => { invalidated = true; } }),
+        /Incomplete repository coverage.*two.*full backfill/);
+        assert.deepEqual(await dump(), before);
+        assert.equal(invalidated, false);
+    });
+    await t.test('partial publication cannot create a new incomplete date', async () => {
+        const before = await dump();
+        await assert.rejects(publish([entry(1)], { partial: true, repositories: repositories.slice(0, 1),
+            snapshotDate: '2026-09-22' }), /Incomplete repository coverage.*two.*full backfill/);
+        assert.deepEqual(await dump(), before);
+    });
+    await t.test('partial publication can fill the last missing row when peers have explicit zero snapshots', async () => {
+        const repairDate = '2026-09-23';
+        await pool.query('INSERT INTO repo_snapshots (repo_id,snapshot_date) VALUES (2,$1)', [repairDate]);
+        const peerBefore = (await pool.query('SELECT * FROM repo_snapshots WHERE repo_id=2 AND snapshot_date=$1', [repairDate])).rows;
+        const before = (await pool.query('SELECT snapshot_generation,last_ingestion_completed_at FROM organizations WHERE id=1')).rows[0];
+        await publish([entry(1, 4)], { partial: true, repositories: repositories.slice(0, 1), snapshotDate: repairDate });
+        assert.deepEqual((await pool.query('SELECT * FROM repo_snapshots WHERE repo_id=2 AND snapshot_date=$1', [repairDate])).rows, peerBefore);
+        assert.deepEqual(await checkSnapshotConsistency(pool, 1, repairDate), []);
+        const after = (await pool.query('SELECT snapshot_generation,last_ingestion_completed_at FROM organizations WHERE id=1')).rows[0];
+        assert.equal(after.snapshot_generation, String(BigInt(before.snapshot_generation) + 1n));
+        assert.deepEqual(after.last_ingestion_completed_at, before.last_ingestion_completed_at);
+        assert.equal((await pool.query('SELECT new_commits FROM activity_snapshots WHERE org_id=1 AND snapshot_date=$1', [repairDate])).rows[0].new_commits, 4);
+    });
     await t.test('read-only check CLI reports coverage, differences and missing dates', async () => {
         const url = new URL(connectionString);
         const env = { ...process.env, DB_HOST: url.hostname, DB_PORT: url.port || '5432',
