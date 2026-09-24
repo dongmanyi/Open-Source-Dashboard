@@ -6,27 +6,18 @@
  *   node backfill_date_range.js --start-date YYYY-MM-DD --end-date YYYY-MM-DD
  *
  * 可选参数:
- *   --flush-cache    回填结束后清空 Redis 缓存
- *   --reset-existing 先删除目标日期范围内的旧数据，再执行回填
+ *   --flush-cache    兼容旧命令；每次发布后自动失效相关缓存
+ *   --reset-existing 忽略已保存进度；旧数据保留到原子发布完成
  *   --help           显示帮助信息
  */
 
 require('dotenv').config();
-const { Pool } = require('pg');
 const path = require('path');
 const {
     runGraphQLBackfillForRange,
     formatDate,
     getScopedProgressFile,
 } = require('./run_graphql_backfill');
-
-const pool = new Pool({
-    user: process.env.DB_USER,
-    host: process.env.DB_HOST,
-    database: process.env.DB_NAME,
-    password: process.env.DB_PASSWORD,
-    port: process.env.DB_PORT,
-});
 
 function printUsage() {
     console.log(`
@@ -41,9 +32,9 @@ Options:
   --date         Backfill a single day
   --start-date   Range start date in YYYY-MM-DD
   --end-date     Range end date in YYYY-MM-DD
-  --flush-cache  Flush Redis after the backfill finishes
+  --flush-cache  Compatibility flag; relevant caches are always invalidated after publication
   --reset-existing
-                 Delete existing rows in the target date range before backfill
+                 Ignore saved progress; preserve existing rows until atomic replacement
   --help         Show this help message
 `);
 }
@@ -67,38 +58,7 @@ function parseDateLiteral(value, flagName) {
     return parsedDate;
 }
 
-async function resetExistingData(startDate, endDate) {
-    const startDateStr = formatDate(startDate);
-    const endDateStr = formatDate(endDate);
-    const client = await pool.connect();
-
-    try {
-        await client.query('BEGIN');
-
-        const deleteTargets = [
-            'contributor_repo_activities',
-            'contributor_daily_activities',
-            'repo_snapshots',
-            'sig_snapshots',
-            'activity_snapshots',
-        ];
-
-        for (const tableName of deleteTargets) {
-            const result = await client.query(
-                `DELETE FROM ${tableName} WHERE snapshot_date BETWEEN $1 AND $2`,
-                [startDateStr, endDateStr]
-            );
-            console.log(`Reset ${tableName}: deleted ${result.rowCount} rows for ${startDateStr} to ${endDateStr}`);
-        }
-
-        await client.query('COMMIT');
-    } catch (error) {
-        await client.query('ROLLBACK');
-        throw error;
-    } finally {
-        client.release();
-    }
-}
+// Existing snapshots remain visible until their replacements commit.
 
 async function main() {
     const args = process.argv.slice(2);
@@ -170,21 +130,18 @@ async function main() {
 
     console.log(`Using progress file: ${path.basename(progressFile)}`);
 
-    try {
-        if (resetExisting) {
-            await resetExistingData(startDate, endDate);
-        }
-
-        await runGraphQLBackfillForRange({
-            startDate,
-            endDate,
-            progressFile,
-            description,
-            flushCache,
-        });
-    } finally {
-        await pool.end();
+    if (resetExisting) {
+        console.log('Ignoring saved progress; existing data will be replaced atomically after collection.');
     }
+
+    await runGraphQLBackfillForRange({
+        startDate,
+        endDate,
+        progressFile,
+        description,
+        flushCache,
+        resetProgress: resetExisting,
+    });
 }
 
 main().catch((error) => {

@@ -131,6 +131,7 @@ psql -d oss_dashboard -f db/views.sql
 psql -d oss_dashboard -f db/migrations/001_github_custom_property_sigs.sql
 psql -d oss_dashboard -f db/migrations/002_repository_organization_membership.sql
 psql -d oss_dashboard -f db/migrations/003_organization_ingestion_freshness.sql
+psql -d oss_dashboard -f db/migrations/004_snapshot_generation.sql
 ```
 
 执行 `002` 后，启动后端或运行 `npm run sync-repository-sigs`，以 GitHub 当前仓库列表刷新组织成员状态。

@@ -13,12 +13,13 @@ async function persistRepoCommitStats({
     snapshotDate,
     commitStats,
     updateOnly = false,
+    client: transactionClient,
 }) {
     const authorStats = commitStats.authorStats || {};
-    const client = await pool.connect();
+    const client = transactionClient || await pool.connect();
 
     try {
-        await client.query('BEGIN');
+        if (!transactionClient) await client.query('BEGIN');
 
         const repoResult = await client.query(
             'SELECT org_id FROM repositories WHERE id = $1 AND sig_id IS NOT NULL',
@@ -68,7 +69,7 @@ async function persistRepoCommitStats({
             );
 
         if (updateOnly && snapshotResult.rows.length === 0) {
-            await client.query('COMMIT');
+            if (!transactionClient) await client.query('COMMIT');
             return { stored: false, snapshotId: null };
         }
 
@@ -139,16 +140,16 @@ async function persistRepoCommitStats({
         }
         await rebuildRepoActiveContributorCount(client, repoId, snapshotDate);
 
-        await client.query('COMMIT');
+        if (!transactionClient) await client.query('COMMIT');
         return {
             stored: true,
             snapshotId: snapshotResult.rows[0]?.id || null,
         };
     } catch (error) {
-        await client.query('ROLLBACK').catch(() => {});
+        if (!transactionClient) await client.query('ROLLBACK').catch(() => {});
         throw error;
     } finally {
-        client.release();
+        if (!transactionClient) client.release();
     }
 }
 

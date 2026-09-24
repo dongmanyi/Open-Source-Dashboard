@@ -91,12 +91,13 @@ async function runContributorTransaction({
     snapshotDate,
     contributorDetails,
     apiMetrics = null,
+    client: transactionClient,
 }) {
     const humanContributorDetails = filterBotContributors(contributorDetails);
-    const client = await pool.connect();
+    const client = transactionClient || await pool.connect();
 
     try {
-        await client.query('BEGIN');
+        if (!transactionClient) await client.query('BEGIN');
 
         const orgResult = await client.query(
             'SELECT id FROM organizations WHERE name = $1',
@@ -141,16 +142,16 @@ async function runContributorTransaction({
             humanContributorDetails,
         });
 
-        await client.query('COMMIT');
+        if (!transactionClient) await client.query('COMMIT');
         return {
             snapshotId,
             storedContributorCount: humanContributorDetails.length,
         };
     } catch (error) {
-        await client.query('ROLLBACK').catch(() => {});
+        if (!transactionClient) await client.query('ROLLBACK').catch(() => {});
         throw error;
     } finally {
-        client.release();
+        if (!transactionClient) client.release();
     }
 }
 

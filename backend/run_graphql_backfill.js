@@ -2,7 +2,7 @@
  * GraphQL Backfill Script
  * 
  * 使用 GraphQL API 高效回填历史数据。
- * 相比 REST API 可以提升约 100 倍性能。
+ * 按日期原子发布，采集窗口限制为七天。
  * 
  * 用法: node run_graphql_backfill.js [days] [--flush-cache]
  * 例如: node run_graphql_backfill.js 365
@@ -16,9 +16,6 @@ const axios = require('axios');
 const fs = require('fs/promises');
 const path = require('path');
 const {
-    isBotContributor,
-} = require('./contributor_filters');
-const {
     fetchCommitHistoryViaGraphQL: fetchCommitHistoryRangeViaGraphQL,
     fetchCommitsViaGraphQL: fetchCommitsForDayViaGraphQL,
 } = require('./github_commit_history');
@@ -31,9 +28,9 @@ const {
     MAX_RATE_LIMIT_RETRIES,
     getPrimaryRateLimitWaitMs,
 } = require('./github_rate_limit');
-const { persistRepoCommitStats } = require('./commit_author_stats');
+const { backfillSnapshotDates } = require('./snapshot_backfill');
+const { readSnapshotGeneration, invalidateSnapshotCaches } = require('./snapshot_batch');
 const {
-    persistRepoApiStats,
     storeContributorActivities: persistContributorActivities,
 } = require('./contributor_api_stats');
 
@@ -43,8 +40,6 @@ const ORG_NAME = 'hust-open-atom-club';
 const PROGRESS_FILE = path.join(__dirname, 'backfill_progress.json');
 
 // --- Optimized Concurrency Settings ---
-const GRAPHQL_CONCURRENCY_LIMIT = 5;  // GraphQL requests (rate limited)
-const COMMIT_CONCURRENCY_LIMIT = 5;   // Commit fetching (also GraphQL)
 const BASE_DELAY_MS = 100;            // Base delay between requests (reduced from 500ms)
 
 // --- Rate Limit Tracking ---
@@ -62,7 +57,8 @@ const pool = new Pool({
 
 // --- Redis Connection ---
 const redisClient = Redis.createClient({
-    url: process.env.REDIS_URL || 'redis://localhost:6379'
+    url: process.env.REDIS_URL || 'redis://localhost:6379',
+    socket: { reconnectStrategy: false },
 });
 redisClient.on('error', (err) => console.error('Redis Client Error', err));
 
@@ -168,274 +164,10 @@ async function githubGraphQL(query, variables = {}, retryCount = 0) {
 
 // --- Fetch Repo Stats via GraphQL ---
 async function fetchRepoStatsViaGraphQL(repoName, startDate, endDate, graphQLClient = githubGraphQL) {
-    const startDateStr = formatDate(startDate);
-    const endDateStr = formatDate(endDate);
-
-    console.log(`[GraphQL] Fetching ${repoName} stats from ${startDateStr} to ${endDateStr}...`);
-
-    const statsMap = new Map();
-    const contributorDetailsMap = new Map(); // 新增：保存每天的贡献者详情
-    const currentDate = new Date(startDate);
-    while (currentDate <= endDate) {
-        const dateKey = formatDate(currentDate);
-        statsMap.set(dateKey, {
-            new_prs: 0,
-            closed_merged_prs: 0,
-            new_issues: 0,
-            closed_issues: 0,
-            active_contributors: new Set(),
-        });
-        contributorDetailsMap.set(dateKey, new Map()); // 每天的贡献者详情
-        currentDate.setDate(currentDate.getDate() + 1);
-    }
-
-    const query = `
-        query RepoStats($owner: String!, $repo: String!, $prCursor: String, $issueCursor: String) {
-            repository(owner: $owner, name: $repo) {
-                pullRequests(first: 100, after: $prCursor, orderBy: {field: CREATED_AT, direction: DESC}) {
-                    totalCount
-                    pageInfo { hasNextPage endCursor }
-                    nodes {
-                        createdAt
-                        closedAt
-                        mergedAt
-                        state
-                        author { 
-                            login 
-                            avatarUrl
-                            ... on User {
-                                databaseId
-                            }
-                        }
-                    }
-                }
-                issues(first: 100, after: $issueCursor, orderBy: {field: CREATED_AT, direction: DESC}) {
-                    totalCount
-                    pageInfo { hasNextPage endCursor }
-                    nodes {
-                        createdAt
-                        closedAt
-                        state
-                        author { 
-                            login 
-                            avatarUrl
-                            ... on User {
-                                databaseId
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    `;
-
-    try {
-        // Fetch PRs with pagination
-        let prCursor = null;
-        let prDone = false;
-        let totalPrsFetched = 0;
-
-        while (!prDone) {
-            const data = await graphQLClient(query, {
-                owner: ORG_NAME,
-                repo: repoName,
-                prCursor: prCursor,
-                issueCursor: null,
-            });
-
-            if (!data?.repository) {
-                throw new Error(`Repository ${repoName} not found or inaccessible.`);
-            }
-
-            const prs = data.repository.pullRequests;
-            totalPrsFetched += prs.nodes.length;
-
-            for (const pr of prs.nodes) {
-                const createdDate = pr.createdAt ? pr.createdAt.split('T')[0] : null;
-                const closedDate = pr.closedAt ? pr.closedAt.split('T')[0] : null;
-
-                if (createdDate && createdDate >= startDateStr && createdDate <= endDateStr) {
-                    if (statsMap.has(createdDate)) {
-                        statsMap.get(createdDate).new_prs++;
-                        if (pr.author?.login && !isBotContributor(pr.author.login)) {
-                            const username = pr.author.login;
-                            statsMap.get(createdDate).active_contributors.add(username);
-
-                            // 保存贡献者详情
-                            const dayContributors = contributorDetailsMap.get(createdDate);
-                            if (!dayContributors.has(username)) {
-                                dayContributors.set(username, {
-                                    username,
-                                    avatar_url: pr.author.avatarUrl || null,
-                                    github_id: pr.author.databaseId || null,
-                                    prs_opened: 0,
-                                    prs_closed: 0,
-                                    issues_opened: 0,
-                                    issues_closed: 0
-                                });
-                            }
-                            dayContributors.get(username).prs_opened++;
-                        }
-                    }
-                }
-
-                if (closedDate && closedDate >= startDateStr && closedDate <= endDateStr) {
-                    if (statsMap.has(closedDate)) {
-                        statsMap.get(closedDate).closed_merged_prs++;
-                        if (pr.author?.login && !isBotContributor(pr.author.login)) {
-                            const username = pr.author.login;
-
-                            // 保存贡献者详情
-                            const dayContributors = contributorDetailsMap.get(closedDate);
-                            if (!dayContributors.has(username)) {
-                                dayContributors.set(username, {
-                                    username,
-                                    avatar_url: pr.author.avatarUrl || null,
-                                    github_id: pr.author.databaseId || null,
-                                    prs_opened: 0,
-                                    prs_closed: 0,
-                                    issues_opened: 0,
-                                    issues_closed: 0
-                                });
-                            }
-                            dayContributors.get(username).prs_closed++;
-                        }
-                    }
-                }
-
-                if (createdDate && createdDate < startDateStr) {
-                    prDone = true;
-                    break;
-                }
-            }
-
-            if (prs.pageInfo.hasNextPage && !prDone) {
-                prCursor = prs.pageInfo.endCursor;
-            } else {
-                prDone = true;
-            }
-        }
-
-        // Fetch Issues with pagination
-        let issueCursor = null;
-        let issueDone = false;
-        let totalIssuesFetched = 0;
-
-        while (!issueDone) {
-            const data = await graphQLClient(query, {
-                owner: ORG_NAME,
-                repo: repoName,
-                prCursor: null,
-                issueCursor: issueCursor,
-            });
-
-            if (!data?.repository) {
-                throw new Error(`Repository ${repoName} not found or inaccessible.`);
-            }
-
-            const issues = data.repository.issues;
-            totalIssuesFetched += issues.nodes.length;
-
-            for (const issue of issues.nodes) {
-                const createdDate = issue.createdAt ? issue.createdAt.split('T')[0] : null;
-                const closedDate = issue.closedAt ? issue.closedAt.split('T')[0] : null;
-
-                if (createdDate && createdDate >= startDateStr && createdDate <= endDateStr) {
-                    if (statsMap.has(createdDate)) {
-                        statsMap.get(createdDate).new_issues++;
-                        if (issue.author?.login && !isBotContributor(issue.author.login)) {
-                            const username = issue.author.login;
-                            statsMap.get(createdDate).active_contributors.add(username);
-
-                            // 保存贡献者详情
-                            const dayContributors = contributorDetailsMap.get(createdDate);
-                            if (!dayContributors.has(username)) {
-                                dayContributors.set(username, {
-                                    username,
-                                    avatar_url: issue.author.avatarUrl || null,
-                                    github_id: issue.author.databaseId || null,
-                                    prs_opened: 0,
-                                    prs_closed: 0,
-                                    issues_opened: 0,
-                                    issues_closed: 0
-                                });
-                            }
-                            dayContributors.get(username).issues_opened++;
-                        }
-                    }
-                }
-
-                if (closedDate && closedDate >= startDateStr && closedDate <= endDateStr) {
-                    if (statsMap.has(closedDate)) {
-                        statsMap.get(closedDate).closed_issues++;
-                        if (issue.author?.login && !isBotContributor(issue.author.login)) {
-                            const username = issue.author.login;
-
-                            // 保存贡献者详情
-                            const dayContributors = contributorDetailsMap.get(closedDate);
-                            if (!dayContributors.has(username)) {
-                                dayContributors.set(username, {
-                                    username,
-                                    avatar_url: issue.author.avatarUrl || null,
-                                    github_id: issue.author.databaseId || null,
-                                    prs_opened: 0,
-                                    prs_closed: 0,
-                                    issues_opened: 0,
-                                    issues_closed: 0
-                                });
-                            }
-                            dayContributors.get(username).issues_closed++;
-                        }
-                    }
-                }
-
-                if (createdDate && createdDate < startDateStr) {
-                    issueDone = true;
-                    break;
-                }
-            }
-
-            if (issues.pageInfo.hasNextPage && !issueDone) {
-                issueCursor = issues.pageInfo.endCursor;
-            } else {
-                issueDone = true;
-            }
-        }
-
-        console.log(`[GraphQL] ${repoName}: Fetched ${totalPrsFetched} PRs and ${totalIssuesFetched} Issues.`);
-
-        // 返回统计数据和贡献者详情
-        return { statsMap, contributorDetailsMap };
-
-    } catch (error) {
-        throw new Error(`[GraphQL] Failed to fetch stats for ${repoName}: ${error.message}`, { cause: error });
-    }
+    return require('./github_repo_history').fetchRepoStatsViaGraphQL(repoName, startDate, endDate, graphQLClient, ORG_NAME);
 }
 
 // --- Store Stats to Database ---
-async function storeRepoApiStatsForDate(repoId, repoName, dateStr, stats, contributorDetails = []) {
-    const apiMetrics = {
-        new_prs: stats.new_prs || 0,
-        closed_merged_prs: stats.closed_merged_prs || 0,
-        new_issues: stats.new_issues || 0,
-        closed_issues: stats.closed_issues || 0,
-        active_contributors: stats.active_contributors instanceof Set ? stats.active_contributors.size : (stats.active_contributors || 0),
-    };
-
-    try {
-        await persistRepoApiStats({
-            pool,
-            orgName: ORG_NAME,
-            repoId,
-            snapshotDate: dateStr,
-            apiMetrics,
-            contributorDetails,
-        });
-    } catch (error) {
-        console.error(`[GraphQL] Error storing stats for ${repoName}@${dateStr}:`, error.message);
-        throw error;
-    }
-}
 
 async function storeContributorActivities(repoId, dateStr, contributorDetails, databasePool = pool) {
     try {
@@ -461,71 +193,6 @@ async function fetchCommitHistoryViaGraphQL(repoName, startDate, endDate, graphQ
     return fetchCommitHistoryRangeViaGraphQL(repoName, startDate, endDate, graphQLClient, ORG_NAME);
 }
 
-/**
- * Fetch and store commit statistics for a repository (GraphQL-based)
- */
-async function fetchAndStoreRepoCommitStats(repoId, repoName, targetDate) {
-    const commitStats = await fetchCommitsViaGraphQL(repoName, targetDate);
-    await storeRepoCommitStats(repoId, repoName, targetDate, commitStats);
-}
-
-async function storeRepoCommitStats(repoId, repoName, targetDate, commitStats) {
-    const targetDateStr = formatDate(targetDate);
-
-    try {
-        await persistRepoCommitStats({
-            pool,
-            repoId,
-            snapshotDate: targetDateStr,
-            commitStats,
-        });
-    } catch (error) {
-        console.error(`[Commits] Error storing commit data for ${repoName}:`, error.message);
-        throw error;
-    }
-}
-
-// --- Aggregation Functions ---
-async function aggregateSigSnapshot(sigId, targetDate) {
-    const targetDateStr = formatDate(targetDate);
-
-    const aggregateResult = await pool.query(
-        `SELECT COALESCE(SUM(rs.new_prs), 0) as new_prs,
-                COALESCE(SUM(rs.closed_merged_prs), 0) as closed_merged_prs,
-                COALESCE(SUM(rs.new_issues), 0) as new_issues,
-                COALESCE(SUM(rs.closed_issues), 0) as closed_issues,
-                COALESCE(SUM(rs.active_contributors), 0) as active_contributors,
-                COALESCE(SUM(rs.new_commits), 0) as new_commits,
-                COALESCE(SUM(rs.lines_added), 0) as lines_added,
-                COALESCE(SUM(rs.lines_deleted), 0) as lines_deleted
-         FROM repo_snapshots rs
-         JOIN repositories r ON rs.repo_id = r.id
-         WHERE r.sig_id = $1 AND rs.snapshot_date = $2`,
-        [sigId, targetDateStr]
-    );
-
-    const agg = aggregateResult.rows[0];
-
-    await pool.query(
-        `INSERT INTO sig_snapshots (sig_id, snapshot_date, new_prs, closed_merged_prs, new_issues, closed_issues, active_contributors, new_commits, lines_added, lines_deleted)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-         ON CONFLICT (sig_id, snapshot_date) DO UPDATE
-         SET new_prs = EXCLUDED.new_prs,
-             closed_merged_prs = EXCLUDED.closed_merged_prs,
-             new_issues = EXCLUDED.new_issues,
-             closed_issues = EXCLUDED.closed_issues,
-             active_contributors = EXCLUDED.active_contributors,
-             new_commits = EXCLUDED.new_commits,
-             lines_added = EXCLUDED.lines_added,
-             lines_deleted = EXCLUDED.lines_deleted,
-             created_at = NOW()`,
-        [sigId, targetDateStr,
-            parseInt(agg.new_prs) || 0, parseInt(agg.closed_merged_prs) || 0,
-            parseInt(agg.new_issues) || 0, parseInt(agg.closed_issues) || 0,
-            parseInt(agg.active_contributors) || 0, parseInt(agg.new_commits) || 0,
-            parseInt(agg.lines_added) || 0, parseInt(agg.lines_deleted) || 0]
-    );
-}
 
 // --- Progress Checkpoint Functions ---
 async function loadProgress(progressFile = PROGRESS_FILE) {
@@ -549,307 +216,49 @@ async function clearProgress(progressFile = PROGRESS_FILE) {
     }
 }
 
-// --- Progress Logging ---
-function formatElapsedTime(startTime) {
-    const elapsed = Math.round((Date.now() - startTime) / 1000);
-    const hours = Math.floor(elapsed / 3600);
-    const minutes = Math.floor((elapsed % 3600) / 60);
-    const seconds = elapsed % 60;
-    if (hours > 0) {
-        return `${hours}h ${minutes}m ${seconds}s`;
-    } else if (minutes > 0) {
-        return `${minutes}m ${seconds}s`;
-    }
-    return `${seconds}s`;
-}
-
-
 // --- Main Backfill Function (Optimized) ---
-async function runGraphQLBackfillForRange({ startDate, endDate, progressFile = PROGRESS_FILE, description, flushCache = false }) {
-    const normalizedStartDate = normalizeDate(startDate);
-    const normalizedEndDate = normalizeDate(endDate);
-
-    if (Number.isNaN(normalizedStartDate.getTime()) || Number.isNaN(normalizedEndDate.getTime())) {
+async function runGraphQLBackfillForRange({ startDate, endDate, progressFile = PROGRESS_FILE, description, repoName = null, resetProgress = false }) {
+    const start = normalizeDate(startDate);
+    const end = normalizeDate(endDate);
+    if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime()) || start > end) {
         throw new Error('Invalid date range for GraphQL backfill.');
     }
-
-    if (normalizedStartDate > normalizedEndDate) {
-        throw new Error('startDate cannot be later than endDate.');
-    }
-
-    const allDates = buildDateList(normalizedStartDate, normalizedEndDate);
-    const runDescription = description || `${formatDate(normalizedStartDate)} to ${formatDate(normalizedEndDate)}`;
-
-    console.log(`\n${'='.repeat(60)}`);
-    console.log(`--- Starting Optimized GraphQL Backfill Job ---`);
-    console.log(`--- Processing ${runDescription} ---`);
-    console.log(`${'='.repeat(60)}\n`);
-
-    const startTime = Date.now();
-    let progress = await loadProgress(progressFile);
-
     try {
-        if (flushCache) {
-            await redisClient.connect();
-        }
-
-        const syncResult = await syncRepositorySigsFromGitHub({
-            pool,
-            githubToken: GITHUB_TOKEN,
-            orgName: ORG_NAME,
-            propertyName: process.env.GITHUB_SIG_PROPERTY || DEFAULT_PROPERTY_NAME,
-        });
-        console.log(
-            `[Repository SIG Sync] ${syncResult.repositories} repositories: ` +
-            `${syncResult.tracked} tracked, ${syncResult.untracked} untracked, ` +
-            `${syncResult.changes.length} changed.`
-        );
-        if (syncResult.changes.length > 0) {
-            if (!redisClient.isOpen) {
-                await redisClient.connect();
-            }
-            await redisClient.flushAll();
-            console.log('[Repository SIG Sync] Redis cache cleared after historical re-aggregation.');
-        }
-
-        const orgsResult = await pool.query("SELECT id FROM organizations WHERE name = $1", [ORG_NAME]);
-        const org = orgsResult.rows[0];
-        if (!org) {
-            console.log('Monitored organization not found. Skipping backfill.');
-            return;
-        }
-
-        const reposResult = await pool.query('SELECT id, name, sig_id FROM repositories WHERE org_id = $1 AND sig_id IS NOT NULL', [org.id]);
-        const repositories = reposResult.rows;
-
-        if (repositories.length === 0) {
-            console.log('No repositories configured to monitor. Skipping backfill.');
-            return;
-        }
-
-        const sigsResult = await pool.query('SELECT id, name FROM special_interest_groups WHERE org_id = $1', [org.id]);
-        const sigs = sigsResult.rows;
-
-        console.log(`📅 Date range: ${formatDate(normalizedStartDate)} to ${formatDate(normalizedEndDate)}`);
-        console.log(`📦 Repositories: ${repositories.length}`);
-        console.log(`🏷️  SIGs: ${sigs.length}`);
-        console.log(`🗂️  Progress file: ${path.basename(progressFile)}`);
-        console.log(`⚡ Commit Concurrency: ${COMMIT_CONCURRENCY_LIMIT}`);
-        console.log(`⚡ GraphQL Concurrency: ${GRAPHQL_CONCURRENCY_LIMIT}`);
-        console.log(`⏱️  Base delay: ${BASE_DELAY_MS}ms\n`);
-
-        // === PHASE 1 & 2: Run commit history and PR/Issue GraphQL tasks in parallel ===
-        console.log('=== PHASE 1 & 2: GraphQL Ingestion (Parallel) ===\n');
-
-        // Build one commit-history task per repository and bucket commits by date locally.
-        const commitTasks = [];
-        let commitReposSkipped = 0;
-        let commitDatesSkipped = 0;
-        for (const repo of repositories) {
-            const pendingDates = allDates.filter((targetDate) => {
-                const dateStr = formatDate(targetDate);
-                // Keep the legacy key so interrupted backfills can resume across this upgrade.
-                const taskKey = `git:${repo.name}:${dateStr}`;
-                if (progress.completedRepos[taskKey]) {
-                    commitDatesSkipped++;
-                    return false;
-                }
-                return true;
-            });
-
-            if (pendingDates.length === 0) {
-                commitReposSkipped++;
-                continue;
-            }
-
-            commitTasks.push(async () => {
-                const statsMap = await fetchCommitHistoryViaGraphQL(
-                    repo.name,
-                    normalizedStartDate,
-                    normalizedEndDate
-                );
-
-                for (const targetDate of pendingDates) {
-                    const dateStr = formatDate(targetDate);
-                    const taskKey = `git:${repo.name}:${dateStr}`;
-                    await storeRepoCommitStats(repo.id, repo.name, targetDate, statsMap.get(dateStr));
-                    progress.completedRepos[taskKey] = true;
-                }
-
+        await redisClient.connect();
+        await syncRepositorySigsFromGitHub({ pool, githubToken: GITHUB_TOKEN,
+            orgName: ORG_NAME, propertyName: process.env.GITHUB_SIG_PROPERTY || DEFAULT_PROPERTY_NAME });
+        const { rows: orgs } = await pool.query('SELECT id FROM organizations WHERE name = $1', [ORG_NAME]);
+        if (!orgs.length) throw new Error('Organization not found');
+        const orgId = orgs[0].id;
+        const { rows: tracked } = await pool.query(
+            'SELECT id, name, sig_id FROM repositories WHERE org_id = $1 AND sig_id IS NOT NULL AND is_in_organization = TRUE ORDER BY id', [orgId]);
+        const repositories = repoName ? tracked.filter(r => r.name === repoName) : tracked;
+        if (!repositories.length) throw new Error('No matching tracked repositories');
+        await invalidateSnapshotCaches(redisClient, pool, orgId, ORG_NAME);
+        // A v2 checkpoint represents committed whole dates, never per-repo writes.
+        // Changed membership or another publisher invalidates the checkpoint.
+        const scope = JSON.stringify({ orgId, repoName, start: formatDate(start), end: formatDate(end), tracked });
+        const generation = await readSnapshotGeneration(pool, orgId);
+        const saved = resetProgress ? null : await loadProgress(progressFile);
+        const progress = saved?.version === 2 && saved.scope === scope && saved.generation === generation
+            ? saved : { version: 2, scope, generation, publishedDates: [] };
+        const dates = buildDateList(start, end).filter(date => !progress.publishedDates.includes(formatDate(date)));
+        console.log('Atomic backfill:', description || scope, 'pending days:', dates.length);
+        await backfillSnapshotDates({ pool, orgId, orgName: ORG_NAME, repositories, dates, partial: Boolean(repoName), expectedGeneration: generation,
+            fetchCommits: (repo, first, last) => fetchCommitHistoryViaGraphQL(repo.name, first, last),
+            fetchApi: (repo, first, last) => fetchRepoStatsViaGraphQL(repo.name, first, last),
+            afterCommit: () => invalidateSnapshotCaches(redisClient, pool, orgId, ORG_NAME),
+            onPublished: async (date, publishedGeneration) => {
+                progress.publishedDates.push(date);
+                progress.generation = publishedGeneration;
                 await saveProgress(progress, progressFile);
-                console.log(`[GraphQL Commits] ${repo.name}: ✅ ${pendingDates.length} days`);
-            });
-        }
-
-        // Build GraphQL tasks (one per repo, fetches entire date range)
-        const graphqlTasks = [];
-        let graphqlTasksSkipped = 0;
-        for (const repo of repositories) {
-            const taskKey = `graphql:${repo.name}`;
-            if (progress.completedRepos[taskKey]) {
-                graphqlTasksSkipped++;
-                continue;
-            }
-            graphqlTasks.push(async () => {
-                try {
-                    const { statsMap, contributorDetailsMap } = await fetchRepoStatsViaGraphQL(repo.name, normalizedStartDate, normalizedEndDate);
-
-                    for (const [dateStr, stats] of statsMap) {
-                        const contributorDetails = contributorDetailsMap.has(dateStr)
-                            ? Array.from(contributorDetailsMap.get(dateStr).values())
-                            : [];
-                        await storeRepoApiStatsForDate(repo.id, repo.name, dateStr, stats, contributorDetails);
-                    }
-
-                    progress.completedRepos[taskKey] = true;
-                    await saveProgress(progress, progressFile);
-                    console.log(`[GraphQL] ${repo.name}: ✅ ${statsMap.size} days (${formatElapsedTime(startTime)}, Rate limit: ${rateLimitRemaining})`);
-                } catch (error) {
-                    console.error(`[GraphQL] ${repo.name}: ❌ ${error.message}`);
-                    throw error;
-                }
-            });
-        }
-
-        console.log(`📊 GraphQL commit repositories: ${commitTasks.length} pending, ${commitReposSkipped} fully skipped (${commitDatesSkipped} completed dates)`);
-        console.log(`📊 GraphQL tasks: ${graphqlTasks.length} pending, ${graphqlTasksSkipped} skipped\n`);
-
-        // Run commit-history and PR/Issue GraphQL tasks in parallel
-        const commitPromise = (async () => {
-            if (commitTasks.length > 0) {
-                console.log(`[GraphQL Commits] Starting ${commitTasks.length} repositories with concurrency ${COMMIT_CONCURRENCY_LIMIT}...`);
-                await runPromisesWithConcurrency(commitTasks, COMMIT_CONCURRENCY_LIMIT);
-                console.log(`[GraphQL Commits] ✅ Complete!`);
-            }
-        })();
-
-        const graphqlPromise = (async () => {
-            if (graphqlTasks.length > 0) {
-                console.log(`[GraphQL] Starting ${graphqlTasks.length} repos with concurrency ${GRAPHQL_CONCURRENCY_LIMIT}...`);
-                await runPromisesWithConcurrency(graphqlTasks, GRAPHQL_CONCURRENCY_LIMIT);
-                console.log(`[GraphQL] ✅ Complete!`);
-            }
-        })();
-
-        const phaseResults = await Promise.allSettled([commitPromise, graphqlPromise]);
-        const phaseFailures = phaseResults
-            .filter((result) => result.status === 'rejected')
-            .map((result) => result.reason);
-        if (phaseFailures.length > 0) {
-            throw new AggregateError(phaseFailures, `${phaseFailures.length} ingestion phase(s) failed.`);
-        }
-        console.log('\n=== PHASE 1 & 2 Complete ===\n');
-
-        // === PHASE 3: Aggregation ===
-        console.log('=== PHASE 3: Data Aggregation ===\n');
-
-        const aggregationBatchSize = 30; // Aggregate 30 days at a time for logging
-        for (let batchStart = 0; batchStart < allDates.length; batchStart += aggregationBatchSize) {
-            const batchEnd = Math.min(batchStart + aggregationBatchSize, allDates.length);
-
-            for (let i = batchStart; i < batchEnd; i++) {
-                const targetDate = allDates[i];
-                const targetDateStr = formatDate(targetDate);
-
-                for (const sig of sigs) {
-                    await aggregateSigSnapshot(sig.id, targetDate);
-                }
-
-                const orgAggregationResult = await pool.query(
-                    `SELECT COALESCE(SUM(ss.new_prs), 0) as new_prs,
-                            COALESCE(SUM(ss.closed_merged_prs), 0) as closed_merged_prs,
-                            COALESCE(SUM(ss.new_issues), 0) as new_issues,
-                            COALESCE(SUM(ss.closed_issues), 0) as closed_issues,
-                            COALESCE(SUM(ss.active_contributors), 0) as active_contributors,
-                            COALESCE(SUM(ss.new_commits), 0) as new_commits,
-                            COALESCE(SUM(ss.lines_added), 0) as lines_added,
-                            COALESCE(SUM(ss.lines_deleted), 0) as lines_deleted
-                     FROM sig_snapshots ss
-                     JOIN special_interest_groups sig ON ss.sig_id = sig.id
-                     WHERE sig.org_id = $1 AND ss.snapshot_date = $2`,
-                    [org.id, targetDateStr]
-                );
-
-                const orgAgg = orgAggregationResult.rows[0];
-
-                await pool.query(
-                    `INSERT INTO activity_snapshots (org_id, snapshot_date, new_prs, closed_merged_prs, new_issues, closed_issues, active_contributors, new_repos, new_commits, lines_added, lines_deleted)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-                     ON CONFLICT (org_id, snapshot_date) DO UPDATE
-                     SET new_prs = EXCLUDED.new_prs,
-                         closed_merged_prs = EXCLUDED.closed_merged_prs,
-                         new_issues = EXCLUDED.new_issues,
-                         closed_issues = EXCLUDED.closed_issues,
-                         active_contributors = EXCLUDED.active_contributors,
-                         new_repos = EXCLUDED.new_repos,
-                         new_commits = EXCLUDED.new_commits,
-                         lines_added = EXCLUDED.lines_added,
-                         lines_deleted = EXCLUDED.lines_deleted,
-                         created_at = NOW()`,
-                    [org.id, targetDateStr,
-                    parseInt(orgAgg.new_prs) || 0, parseInt(orgAgg.closed_merged_prs) || 0,
-                    parseInt(orgAgg.new_issues) || 0, parseInt(orgAgg.closed_issues) || 0,
-                    parseInt(orgAgg.active_contributors) || 0, 0,
-                    parseInt(orgAgg.new_commits) || 0, parseInt(orgAgg.lines_added) || 0,
-                    parseInt(orgAgg.lines_deleted) || 0]
-                );
-            }
-
-            const pct = Math.round((batchEnd / allDates.length) * 100);
-            console.log(`[Aggregation] Progress: ${pct}% (${formatElapsedTime(startTime)})`);
-        }
-
-        console.log('=== PHASE 3 Complete ===\n');
-
-        if (flushCache) {
-            console.log('--- Clearing Redis Cache ---');
-            await redisClient.flushAll();
-            console.log('✅ Redis cache cleared.');
-        } else {
-            console.log('Skipping Redis cache flush. Pass --flush-cache to enable it.');
-        }
-
-        // Display contributor statistics
-        console.log('\n=== Contributor Statistics ===');
-        try {
-            const contributorStatsResult = await pool.query(`
-                SELECT 
-                    COUNT(DISTINCT c.id) as total_contributors,
-                    COUNT(DISTINCT CASE WHEN c.first_seen_date >= $1 THEN c.id END) as new_contributors,
-                    COUNT(DISTINCT cda.snapshot_date) as days_with_activity,
-                    SUM(cda.prs_opened + cda.prs_closed + cda.issues_opened + cda.issues_closed) as total_activities
-                FROM contributors c
-                LEFT JOIN contributor_daily_activities cda ON c.id = cda.contributor_id AND cda.snapshot_date >= $1
-            `, [formatDate(normalizedStartDate)]);
-
-            const cStats = contributorStatsResult.rows[0];
-            console.log(`  - 总贡献者数: ${cStats.total_contributors || 0}`);
-            console.log(`  - 新贡献者: ${cStats.new_contributors || 0}`);
-            console.log(`  - 有活动的天数: ${cStats.days_with_activity || 0}`);
-            console.log(`  - 总活动数: ${cStats.total_activities || 0}`);
-        } catch (error) {
-            console.log('  - (贡献者统计不可用，可能需要先创建表)');
-        }
-        console.log('='.repeat(30) + '\n');
-
-        // Clear progress file on success
+                console.log('Published complete date:', date);
+            },
+        });
         await clearProgress(progressFile);
-
-        console.log(`\n${'='.repeat(60)}`);
-        console.log(`--- GraphQL Backfill Job Finished Successfully ---`);
-        console.log(`⏱️  Total time: ${formatElapsedTime(startTime)}`);
-        console.log(`${'='.repeat(60)}\n`);
-
-    } catch (error) {
-        console.error('GraphQL Backfill Job Failed:', error.message);
-        console.error(error.stack);
-        console.log('Progress saved. Run again to resume.');
-        throw error;
     } finally {
         await pool.end();
-        if (redisClient.isOpen) {
-            await redisClient.quit();
-        }
+        if (redisClient.isOpen) await redisClient.quit();
     }
 }
 

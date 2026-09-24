@@ -4,11 +4,13 @@ on:
     branches: [main]
     paths:
       - 'backend/**'
+      - 'db/**'
       - '.github/workflows/backend-ci.yml'
   pull_request:
     branches: [main]
     paths:
       - 'backend/**'
+      - 'db/**'
       - '.github/workflows/backend-ci.yml'
 
 permissions:
@@ -18,6 +20,19 @@ jobs:
   test:
     name: Backend Tests (Node.js 20)
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: snapshot_test
+          POSTGRES_DB: snapshot_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
 
     defaults:
       run:
@@ -39,3 +54,5 @@ jobs:
 
       - name: Run tests
         run: npm test
+        env:
+          SNAPSHOT_TEST_DATABASE_URL: postgres://postgres:snapshot_test@localhost:5432/snapshot_test

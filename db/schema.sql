@@ -7,7 +7,8 @@ CREATE TABLE organizations (
     id SERIAL PRIMARY KEY,
     name VARCHAR(255) UNIQUE NOT NULL,
     created_at TIMESTAMPTZ DEFAULT NOW(),
-    last_ingestion_completed_at TIMESTAMPTZ
+    last_ingestion_completed_at TIMESTAMPTZ,
+    snapshot_generation BIGINT NOT NULL DEFAULT 0
 );
 
 -- Table: special_interest_groups
